@@ -225,8 +225,15 @@ class NativeTrace
  * temporarily stop the tracking as desired. The singleton manages a mirror copy of the Python stack
  * so it can be accessed synchronized by its the allocation tracking interfaces.
  * */
+class PythonStackTracker;
+
 class Tracker
 {
+    // Replacing a thread's Python stack writes records, so these must hold
+    // the Tracker lock to do it.
+    friend class PythonStackTracker;
+    friend void install_trace_function();
+
   public:
     // Constructors
     ~Tracker();

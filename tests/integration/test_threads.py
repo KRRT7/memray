@@ -144,3 +144,73 @@ def test_setting_python_thread_name(tmpdir):
         if rec.allocator == AllocatorType.VALLOC
     ]
     assert names == expected_names
+
+
+def test_replacing_initial_stacks_does_not_corrupt_output(tmp_path, capfd):
+    """Threads running before tracking starts get a frozen copy of their
+    stack, which is replaced (writing pops for any frames already emitted) on
+    their first profile event. That write must not race with other threads'
+    writes, or the capture file is corrupted.
+    """
+    import os
+    import zlib
+
+    from memray._test import allocate_without_gil_held
+
+    n_blocked, depth, rounds = 96, 300, 40
+    data = bytes(range(256)) * 20000
+
+    def blocked(depth, read_fd, write_fd):
+        if depth:
+            return blocked(depth - 1, read_fd, write_fd)
+        # Blocks until released, then allocates without the GIL, emitting
+        # the frozen stack. Returning replaces that stack.
+        allocate_without_gil_held(write_fd, read_fd)
+
+    def noisy(stop):
+        while not stop.is_set():
+            zlib.compress(data, 1)  # allocates without the GIL
+
+    for round in range(rounds):
+        # GIVEN
+        output = tmp_path / f"test{round}.bin"
+        pipes = [(os.pipe(), os.pipe()) for _ in range(n_blocked)]
+        threads = [
+            threading.Thread(target=blocked, args=(depth, go[0], ready[1]))
+            for ready, go in pipes
+        ]
+        for thread in threads:
+            thread.start()
+        for ready, _ in pipes:
+            os.read(ready[0], 1)
+
+        # WHEN
+        stop = threading.Event()
+        with Tracker(output):
+            noise = [threading.Thread(target=noisy, args=(stop,)) for _ in range(8)]
+            for thread in noise:
+                thread.start()
+            for _, go in pipes:
+                os.write(go[1], b"x")
+            for thread in threads:
+                thread.join()
+            stop.set()
+            for thread in noise:
+                thread.join()
+        for ready, go in pipes:
+            for fd in (*ready, *go):
+                os.close(fd)
+
+        # THEN
+        # Reading a corrupted file logs an error and stops early, so fewer
+        # records may be read back than the header says were written.
+        reader = FileReader(output)
+        records = list(reader.get_allocation_records())
+        assert "Invalid record type" not in capfd.readouterr().err
+        assert len(records) == reader.metadata.total_allocations
+        vallocs = [
+            record
+            for record in records
+            if record.allocator == AllocatorType.VALLOC and record.size in (1234, 4321)
+        ]
+        assert len(vallocs) == 2 * n_blocked

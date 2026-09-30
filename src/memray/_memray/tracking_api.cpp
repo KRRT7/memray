@@ -451,6 +451,9 @@ PythonStackTracker::handleTraceEvent(int what, PyFrameObject* frame)
         // to sys.settrace tracing functions on it. Drop it now, replacing it
         // with a stack fetched from PyEval_GetFrame which we know can't have
         // trace function frames on it, and which we can track properly.
+        // This writes pops for any frames already emitted, so like any other
+        // write it needs the Tracker lock.
+        std::unique_lock<std::mutex> lock(*Tracker::s_mutex);
         populateShadowStack();
 
         if (what == PyTrace_CALL) {
@@ -1636,7 +1639,12 @@ install_trace_function()
     }
 
     PyEval_SetProfile(PyTraceFunction, nullptr);
-    PythonStackTracker::get().populateShadowStack();
+    PythonStackTracker& stack = PythonStackTracker::get();
+    // This can run Python code, so it must not be done holding the lock.
+    stack.installGreenletTraceFunctionIfNeeded();
+    // This writes pops for any frames already emitted, so needs the lock.
+    std::unique_lock<std::mutex> lock(*Tracker::s_mutex);
+    stack.populateShadowStack();
 }
 
 }  // namespace memray::tracking_api
